@@ -1,0 +1,9 @@
+{
+  "name": "chat-bots-node",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@msgpack/msgpack": "^3.0.0",
+    "zeromq": "^6.0.0"
+  }
+}
