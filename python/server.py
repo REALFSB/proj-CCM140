@@ -1,19 +1,25 @@
 import json
 import os
 import re
+import time
 
 import zmq
 
-from common import log, now_ms, pack, unpack
+from common import clock, log, now_ms, pack, unpack
 
 NAME = os.environ.get("SERVER_NAME", "server_py")
 BROKER = os.environ.get("BROKER_BACKEND", "tcp://broker:5556")
 PROXY_XSUB = os.environ.get("PROXY_XSUB", "tcp://proxy:5557")
+REFERENCE = os.environ.get("REFERENCE_ADDR", "tcp://reference:5559")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 
 VALID_NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 RESERVED_CHANNELS = {"servers"}  # tópico usado na eleição (Parte 4)
 MAX_MESSAGE_LEN = 500
+HEARTBEAT_EVERY = 10   # mensagens de clientes recebidas entre heartbeats
+REF_TIMEOUT_MS = 3000
+
+ctx = zmq.Context()
 
 
 class Storage:
@@ -33,7 +39,7 @@ class Storage:
                     if rec.get("type") == "channel" and rec["name"] not in self.channels:
                         self.channels.append(rec["name"])
                     elif rec.get("type") == "message":
-                        self.messages.append({k: rec[k] for k in ("channel", "user", "message", "timestamp")})
+                        self.messages.append({k: rec.get(k) for k in ("channel", "user", "message", "timestamp", "clock")})
         self.file = open(path, "a", encoding="utf-8")
 
     def append(self, rec):
@@ -47,7 +53,8 @@ class Storage:
 
 
 def reply(service, status, description="", **extra):
-    data = {"status": status, "description": description, "timestamp": now_ms(), "server": NAME}
+    data = {"status": status, "description": description, "timestamp": now_ms(),
+            "clock": clock.tick(), "server": NAME}
     data.update(extra)
     return {"service": service, "data": data}
 
@@ -61,6 +68,7 @@ def handle(req, store, pub):
         return reply("desconhecido", "erro", "mensagem inválida")
     service = req.get("service")
     data = req.get("data") or {}
+    clock.update(data.get("clock"))  # relógio lógico: max(local, recebido)
 
     if service == "login":
         user = data.get("user")
@@ -93,8 +101,8 @@ def handle(req, store, pub):
             return reply(service, "erro", "canal inválido")
         if not isinstance(message, str) or not message.strip() or len(message) > MAX_MESSAGE_LEN:
             return reply(service, "erro", f"mensagem vazia ou maior que {MAX_MESSAGE_LEN} caracteres")
-        ts = now_ms()
-        msg = {"channel": channel, "user": user, "message": message, "timestamp": ts}
+        msg = {"channel": channel, "user": user, "message": message,
+               "timestamp": now_ms(), "clock": clock.tick()}  # tick: a publicação também é um envio
         store.add_message(msg, data.get("timestamp"))  # grava antes de publicar
         payload = {"service": "publication", "data": {**msg, "server": NAME}}
         pub.send_multipart([channel.encode(), pack(payload)])  # tópico = nome do canal
@@ -114,16 +122,66 @@ def handle(req, store, pub):
     return reply(str(service), "erro", "serviço desconhecido")
 
 
+# ---------- comunicação com o serviço de referência ----------
+def ref_call(service):
+    """REQ ao serviço de referência. Devolve (resposta, t0, t1) ou None se não responder."""
+    msg = {"service": service, "data": {"name": NAME, "timestamp": now_ms(), "clock": clock.tick()}}
+    sock = ctx.socket(zmq.REQ)
+    sock.setsockopt(zmq.LINGER, 0)
+    sock.setsockopt(zmq.RCVTIMEO, REF_TIMEOUT_MS)
+    sock.connect(REFERENCE)
+    try:
+        log(NAME, "ENV->REF", msg)
+        t0 = clock.raw_ms()
+        sock.send(pack(msg))
+        rep = unpack(sock.recv())
+        t1 = clock.raw_ms()
+        clock.update(rep["data"].get("clock"))
+        log(NAME, "REC<-REF", rep)
+        return rep, t0, t1
+    except zmq.Again:
+        log(NAME, "AVISO", {"description": "serviço de referência não respondeu"})
+        return None
+    finally:
+        sock.close()
+
+
+def register():
+    """Pede o rank ao iniciar; repete até o serviço de referência responder."""
+    while True:
+        res = ref_call("rank")
+        if res and res[0]["data"].get("status") == "sucesso":
+            return res[0]["data"]["rank"]
+        time.sleep(2)
+
+
+def heartbeat():
+    """Avisa que está vivo, ajusta o relógio físico com a hora recebida e atualiza a lista de servidores."""
+    res = ref_call("heartbeat")
+    if res and res[0]["data"].get("status") == "sucesso":
+        rep, t0, t1 = res
+        offset = clock.sync(rep["data"]["time"], t0, t1)
+        log(NAME, "RELOGIO", f"relógio físico ajustado: offset {offset:+d} ms (rtt {t1 - t0} ms)")
+    res = ref_call("list")
+    if res and res[0]["data"].get("status") == "sucesso":
+        servers = ", ".join(f"{s['name']} (rank {s['rank']})" for s in res[0]["data"]["servers"])
+        log(NAME, "SERVIDORES", servers or "nenhum")
+
+
 def main():
     store = Storage(os.path.join(DATA_DIR, f"{NAME}.jsonl"))
-    ctx = zmq.Context()
-    sock = ctx.socket(zmq.REP)
-    sock.connect(BROKER)
     pub = ctx.socket(zmq.PUB)
     pub.connect(PROXY_XSUB)
-    log(NAME, "INFO", {"description": f"broker {BROKER} | proxy {PROXY_XSUB}",
-                       "canais_carregados": len(store.channels), "mensagens_carregadas": len(store.messages)})
 
+    rank = register()
+    log(NAME, "INFO", {"description": f"broker {BROKER} | proxy {PROXY_XSUB} | referência {REFERENCE}",
+                       "rank": rank, "canais_carregados": len(store.channels),
+                       "mensagens_carregadas": len(store.messages)})
+    heartbeat()  # sincroniza o relógio antes de atender clientes
+
+    sock = ctx.socket(zmq.REP)
+    sock.connect(BROKER)  # só entra no balanceamento depois de registrado e sincronizado
+    handled = 0
     while True:
         raw = sock.recv()
         try:
@@ -134,6 +192,9 @@ def main():
             rep = reply("desconhecido", "erro", f"falha ao processar: {exc}")
         log(NAME, "ENVIADO", rep)
         sock.send(pack(rep))
+        handled += 1
+        if handled % HEARTBEAT_EVERY == 0:
+            heartbeat()
 
 
 if __name__ == "__main__":

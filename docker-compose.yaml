@@ -18,34 +18,39 @@ services:
     <<: *python
     command: python proxy.py
 
+  reference:         # referência: rank, lista de servidores, heartbeat e hora (:5559, só servidores)
+    <<: *python
+    command: python reference.py
+    environment: { HEARTBEAT_TIMEOUT: "30" }
+
   # ---------- Servidores ----------
   server_py_1:
     <<: *python
     command: python server.py
     environment: { SERVER_NAME: server_py_1 }
     volumes: [ "data_server_py_1:/data" ]
-    depends_on: [ broker, proxy ]
+    depends_on: [ broker, proxy, reference ]
 
   server_py_2:
     <<: *python
     command: python server.py
-    environment: { SERVER_NAME: server_py_2 }
+    environment: { SERVER_NAME: server_py_2, CLOCK_SKEW_MS: "3000" }   # relógio 3 s adiantado (teste)
     volumes: [ "data_server_py_2:/data" ]
-    depends_on: [ broker, proxy ]
+    depends_on: [ broker, proxy, reference ]
 
   server_js_1:
     <<: *node
     command: node server.js
     environment: { SERVER_NAME: server_js_1 }
     volumes: [ "data_server_js_1:/data" ]
-    depends_on: [ broker, proxy ]
+    depends_on: [ broker, proxy, reference ]
 
   server_js_2:
     <<: *node
     command: node server.js
-    environment: { SERVER_NAME: server_js_2 }
+    environment: { SERVER_NAME: server_js_2, CLOCK_SKEW_MS: "-2000" }  # relógio 2 s atrasado (teste)
     volumes: [ "data_server_js_2:/data" ]
-    depends_on: [ broker, proxy ]
+    depends_on: [ broker, proxy, reference ]
 
   # ---------- Clientes (bots) ----------
   bot_py_1:
