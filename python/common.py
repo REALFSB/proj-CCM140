@@ -11,7 +11,7 @@ class Clock:
 
     Lógico:  tick() antes de cada envio; update(recebido) = max(local, recebido) a cada recebimento.
     Físico:  o relógio do SO não é alterado; mantemos um deslocamento (offset) que é corrigido na
-             sincronização com o serviço de referência. CLOCK_SKEW_MS simula um relógio com defeito
+             sincronização com o coordenador (Berkeley). CLOCK_SKEW_MS simula um relógio com defeito
              (só para demonstrar a sincronização; o padrão é 0).
     """
 
@@ -36,8 +36,13 @@ class Clock:
         """Relógio local corrigido: usado em todos os timestamps de envio."""
         return self.raw_ms() + self.offset_ms
 
+    def adjust(self, delta_ms):
+        """Soma um ajuste ao deslocamento (usado pelo coordenador ao adotar a média de Berkeley)."""
+        self.offset_ms += delta_ms
+        return self.offset_ms
+
     def sync(self, ref_time, t0, t1):
-        """Ajusta o offset com a hora do serviço de referência, compensando metade do RTT."""
+        """Ajusta o offset com a hora correta recebida do coordenador, compensando metade do RTT."""
         estimate = ref_time + (t1 - t0) // 2
         self.offset_ms = estimate - t1
         return self.offset_ms

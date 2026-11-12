@@ -1,4 +1,4 @@
-"""Serviço de referência: rank, lista de servidores, heartbeat e hora correta.
+"""Serviço de referência: rank, lista de servidores e heartbeat.
 
 Só conversa com servidores (REP em :5559). Mantém o rank por ordem de cadastro, sem repetir
 nomes, e remove da lista o servidor que ficar sem enviar heartbeat por HEARTBEAT_TIMEOUT segundos.
@@ -58,7 +58,7 @@ def handle(req):
         rank = register(name)  # heartbeat de servidor desconhecido/removido também o cadastra
         if service == "rank":
             return reply(service, "sucesso", "", rank=rank)
-        return reply(service, "sucesso", "OK", time=now_ms())  # hora correta, para o ajuste do relógio
+        return reply(service, "sucesso", "OK")  # só confirma; a hora agora vem do coordenador (Parte 4)
 
     if service == "list":
         prune()

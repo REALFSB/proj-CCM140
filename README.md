@@ -3,9 +3,9 @@
 Projeto de Sistemas Distribuídos. Bots (clientes) conversam com servidores usando **ZeroMQ**,
 tudo executado em containers e orquestrado com Docker Compose. Nenhuma interação humana é necessária.
 
-> **Estado atual: Parte 3** — login, canais, publicação/inscrição (Pub/Sub), persistência,
-> histórico, **relógio lógico em todas as mensagens, serviço de referência (rank, lista de
-> servidores, heartbeat) e sincronização do relógio físico dos servidores**.
+> **Estado atual: Parte 4** — login, canais, publicação/inscrição (Pub/Sub), persistência,
+> histórico, relógio lógico, serviço de referência (rank, lista, heartbeat) e, **nesta parte,
+> eleição de coordenador (Bully) e sincronização do relógio físico pelo algoritmo de Berkeley**.
 
 ## Como executar
 
@@ -27,6 +27,8 @@ imprimem as publicações recebidas assim:
 REQ/REP:  bots (REQ) ──► broker :5555 (ROUTER) ──round-robin──► :5556 (DEALER) ◄── servidores (REP)
 PUB/SUB:  servidores (PUB) ──► proxy :5557 (XSUB) ──► :5558 (XPUB) ──► bots (SUB)
 REQ/REP:  servidores (REQ) ──► serviço de referência :5559 (REP)      (os bots não falam com ele)
+REQ/REP:  servidor (REQ) ◄──► outro servidor :6000 (REP)                (relógio e eleição; porta interna)
+PUB/SUB:  coordenador eleito (PUB) ──► proxy ──► todos os servidores (SUB, tópico `servers`)
 ```
 
 | Serviço | Linguagem | Quantidade |
@@ -108,7 +110,7 @@ Todas as requisições levam `data.name` (nome do servidor).
 |---|---|---|
 | `rank` | `rank` | cadastra o servidor (sem repetir nomes) e devolve seu rank |
 | `list` | `servers`: `[{name, rank}, ...]` | lista os servidores disponíveis |
-| `heartbeat` | `description: "OK"`, `time` | marca o servidor como vivo e devolve a hora correta |
+| `heartbeat` | `description: "OK"` | marca o servidor como vivo (a resposta não traz mais a hora) |
 
 ## Relógio lógico
 
@@ -133,25 +135,69 @@ um novo envio e incrementa o contador.
 - **Heartbeat:** cada servidor o envia **a cada 10 mensagens de clientes recebidas** (e mais um
   logo ao iniciar). Em seguida pede a lista de servidores e a exibe no log (`SERVIDORES`).
 - **Início do servidor:** ele pede o rank (repetindo até o serviço responder), faz o primeiro
-  heartbeat e só então se conecta ao broker, para não receber requisições antes de estar sincronizado.
+  heartbeat, abre o canal entre servidores, realiza a eleição e a primeira sincronização do relógio,
+  e só então se conecta ao broker, para não receber requisições antes de estar sincronizado.
 
 Como o heartbeat é por contagem de mensagens, um servidor sem tráfego por mais que o timeout seria
 removido da lista até o próximo heartbeat. Com 4 bots enviando cerca de 1 mensagem por segundo cada,
 cada servidor envia um heartbeat a cada ~10 s, bem abaixo dos 30 s.
 
-## Sincronização do relógio físico dos servidores
+## Eleição de coordenador (algoritmo Bully)
 
-Não se altera o relógio do sistema: cada servidor mantém um deslocamento (offset) somado ao relógio
-local, e **todo `timestamp` enviado usa o relógio corrigido**. A cada heartbeat, o servidor recebe a
-hora do serviço de referência (`time`) e calcula `offset = (time + RTT/2) - relógio_local`, em que o
-RTT é medido no próprio pedido. É a abordagem de Cristian (servidor de tempo único), que atende ao
-que o enunciado pede nesta parte (o servidor pede a hora ao serviço de referência).
+Cada servidor mantém a variável `coordinator` com o **nome do servidor eleito**. O servidor de
+**maior rank** vence (o rank vem do serviço de referência, por ordem de cadastro).
 
-**Teste da sincronização:** containers compartilham o relógio do host, então nada estaria
-dessincronizado. Por isso o Compose define `CLOCK_SKEW_MS` em dois servidores para simular relógios
-com defeito (`server_py_2` com +3000 ms e `server_js_2` com −2000 ms). Nos logs, esses servidores
-mostram `RELOGIO relógio físico ajustado: offset -3000 ms` (e `+2000 ms`), e os demais mostram
-`offset +0 ms`. Para desligar a simulação, basta remover essa variável (o padrão é 0).
+Mensagens (todas com `timestamp` e `clock`):
+
+| Mensagem | Padrão | Conteúdo |
+|---|---|---|
+| `election` | `REQ` servidor A → servidor B, `REP: OK` | A envia `name` e `rank`; B responde `status: "OK"` e o `coordinator` que conhece |
+| `clock` | `REQ` servidor → coordenador, `REP: hora correta` | pedido com `name` e `time`; resposta com `time` (hora correta) |
+| anúncio | `PUB` no tópico `servers` | `[servers, {coordinator, rank, timestamp, clock}]`: o eleito avisa todos os servidores |
+
+Funcionamento:
+
+1. **Ao iniciar:** o servidor pede a lista à referência e envia `election` a **todos os servidores de
+   rank maior**. Se nenhum responder `OK` (timeout de 2 s), ele vence e publica seu nome em `servers`.
+   Se algum responder, esse servidor assume a eleição, e o de maior rank que respondeu fica como
+   coordenador provisório até o anúncio chegar.
+2. **Quem recebe `election` de um rank menor** responde `OK` e inicia a própria eleição.
+3. **Coordenador indisponível:** a cada sincronização do relógio (abaixo), se o coordenador não
+   responder, o servidor pede eleição aos de rank maior e tenta de novo com o novo coordenador.
+4. **Servidor de rank maior que volta** (mesmo nome, mesmo rank) vence a eleição ao iniciar e reassume.
+5. **Anúncio de um rank menor** faz o servidor de rank maior iniciar eleição, para que o maior sempre vença.
+6. **Recuperação:** se o servidor consultado para o relógio não for o coordenador, ele responde
+   `erro` indicando quem é, e o solicitante passa a usar essa indicação. Isso cobre anúncios
+   perdidos (o Pub/Sub não garante entrega a quem acabou de assinar).
+
+Os servidores se enxergam em `tcp://<nome>:6000` pela rede do Compose (porta interna, não publicada).
+O tópico `servers` é verificado por igualdade exata, pois o filtro do SUB é por prefixo.
+
+## Sincronização do relógio físico (algoritmo de Berkeley)
+
+A cada **15 mensagens de clientes recebidas**, o servidor pede a hora ao coordenador. O relógio do
+sistema não é alterado: cada servidor mantém um deslocamento (offset) somado ao relógio local, e todo
+`timestamp` enviado usa o relógio corrigido. O serviço de referência **não responde mais a hora**.
+
+No Berkeley não há uma fonte de tempo externa: o coordenador calcula a média dos relógios do grupo.
+
+1. O servidor envia `clock` com o próprio relógio (`time`).
+2. O coordenador guarda o último relógio reportado por cada servidor e estima o valor atual de cada
+   um somando o tempo decorrido desde o relato (relatos com mais de 60 s são ignorados).
+3. Ele calcula a **média** desses relógios e do seu próprio, **adota essa média** e a devolve como
+   hora correta (`time`).
+4. O servidor ajusta o offset para a hora recebida, compensando metade do RTT medido no pedido.
+
+Assim, com o tempo, todos os relógios convergem para um valor comum (a média do grupo, e não a hora
+do host). O coordenador não envia pedidos de relógio a si mesmo: ele se ajusta ao atender os outros.
+Ao mudar o coordenador, a tabela de relatos é descartada e recomeça no novo.
+
+**Como conferir:** os containers compartilham o relógio do host, então o Compose define
+`CLOCK_SKEW_MS` em dois servidores para simular relógios com defeito (`server_py_2` com +3000 ms e
+`server_js_2` com −2000 ms). O log mostra `offset total` em cada sincronização (`RELOGIO` nos
+servidores e `BERKELEY` no coordenador). Somando o defeito simulado ao offset de cada servidor, o
+resultado deve ser praticamente o mesmo nos quatro (nos testes, diferenças de poucos milissegundos).
+Para desligar a simulação, remova a variável (o padrão é 0).
 
 ## Tratamento de erros
 
@@ -162,6 +208,8 @@ mostram `RELOGIO relógio físico ajustado: offset -3000 ms` (e `+2000 ms`), e o
   reservado `servers` (será o tópico de eleição na Parte 4).
 - **Publicação:** erro se o usuário ou o canal forem inválidos (incluindo `servers`), ou se a
   mensagem for vazia ou maior que 500 caracteres.
+- **Servidores entre si:** esperam 2 s por outro servidor; sem resposta, ele é tratado como
+  indisponível (disparando a eleição quando é o coordenador).
 - **Sem resposta:** o bot espera 5 s; se não houver resposta, recria o socket e reenvia. Os servidores
   esperam 3 s pelo serviço de referência e, se ele não responder, seguem atendendo clientes e tentam
   de novo no próximo heartbeat.
