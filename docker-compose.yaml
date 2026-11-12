@@ -1,0 +1,74 @@
+x-python: &python
+  build: ./python
+  image: sd-python
+  restart: on-failure
+
+x-node: &node
+  build: ./node
+  image: sd-node
+  restart: on-failure
+
+services:
+  broker:
+    <<: *python
+    command: python broker.py
+
+  # ---------- Servidores ----------
+  server_py_1:
+    <<: *python
+    command: python server.py
+    environment: { SERVER_NAME: server_py_1 }
+    volumes: [ "data_server_py_1:/data" ]
+    depends_on: [ broker ]
+
+  server_py_2:
+    <<: *python
+    command: python server.py
+    environment: { SERVER_NAME: server_py_2 }
+    volumes: [ "data_server_py_2:/data" ]
+    depends_on: [ broker ]
+
+  server_js_1:
+    <<: *node
+    command: node server.js
+    environment: { SERVER_NAME: server_js_1 }
+    volumes: [ "data_server_js_1:/data" ]
+    depends_on: [ broker ]
+
+  server_js_2:
+    <<: *node
+    command: node server.js
+    environment: { SERVER_NAME: server_js_2 }
+    volumes: [ "data_server_js_2:/data" ]
+    depends_on: [ broker ]
+
+  # ---------- Clientes (bots) ----------
+  bot_py_1:
+    <<: *python
+    command: python client.py
+    environment: { BOT_NAME: bot_py_1 }
+    depends_on: [ broker, server_py_1, server_js_1 ]
+
+  bot_py_2:
+    <<: *python
+    command: python client.py
+    environment: { BOT_NAME: bot_py_2 }
+    depends_on: [ broker, server_py_1, server_js_1 ]
+
+  bot_js_1:
+    <<: *node
+    command: node client.js
+    environment: { BOT_NAME: bot_js_1 }
+    depends_on: [ broker, server_py_1, server_js_1 ]
+
+  bot_js_2:
+    <<: *node
+    command: node client.js
+    environment: { BOT_NAME: bot_js_2 }
+    depends_on: [ broker, server_py_1, server_js_1 ]
+
+volumes:
+  data_server_py_1:
+  data_server_py_2:
+  data_server_js_1:
+  data_server_js_2:
