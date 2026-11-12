@@ -4,7 +4,7 @@ import time
 
 import zmq
 
-from common import fmt_time, log, now_ms, pack, unpack
+from common import clock, fmt_time, log, now_ms, pack, unpack
 
 NAME = os.environ.get("BOT_NAME", "bot_py")
 BROKER = os.environ.get("BROKER_FRONTEND", "tcp://broker:5555")
@@ -37,8 +37,9 @@ def drain(timeout_ms=0):
         if channel not in subscribed:  # o filtro do SUB é por prefixo: descarta falsos positivos
             continue
         d = unpack(raw)["data"]
+        clock.update(d.get("clock"))  # relógio lógico: max(local, recebido)
         log(NAME, "MENSAGEM", f"#{channel} {d['user']}: {d['message']}  "
-                              f"(enviado {fmt_time(d['timestamp'])} | recebido {fmt_time(received)})")
+                              f"(enviado {fmt_time(d['timestamp'])} | recebido {fmt_time(received)} | relógio {d['clock']})")
 
 
 def pause(seconds):
@@ -50,9 +51,9 @@ def pause(seconds):
 
 def request(service, data):
     """REQ com timeout: se não houver resposta, recria o socket e reenvia."""
-    msg = {"service": service, "data": {**data, "timestamp": now_ms()}}
-    payload = pack(msg)
     while True:
+        msg = {"service": service, "data": {**data, "timestamp": now_ms(), "clock": clock.tick()}}
+        payload = pack(msg)
         sock = ctx.socket(zmq.REQ)
         sock.setsockopt(zmq.LINGER, 0)
         sock.setsockopt(zmq.RCVTIMEO, TIMEOUT_MS)
@@ -61,6 +62,7 @@ def request(service, data):
             log(NAME, "ENVIADO", msg)
             sock.send(payload)
             rep = unpack(sock.recv())
+            clock.update(rep["data"].get("clock"))  # relógio lógico: max(local, recebido)
             log(NAME, "RECEBIDO", rep)
             return rep
         except zmq.Again:

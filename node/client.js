@@ -1,5 +1,5 @@
 const zmq = require("zeromq");
-const { encode, decode, nowMs, fmtTime, log } = require("./common");
+const { encode, decode, clock, nowMs, fmtTime, log } = require("./common");
 
 const NAME = process.env.BOT_NAME || "bot_js";
 const BROKER = process.env.BROKER_FRONTEND || "tcp://broker:5555";
@@ -29,16 +29,17 @@ let counter = 0;
     const channel = topic.toString();
     if (!subscribed.has(channel)) continue; // o filtro do SUB é por prefixo: descarta falsos positivos
     const d = decode(raw).data;
+    clock.update(d.clock); // relógio lógico: max(local, recebido)
     log(NAME, "MENSAGEM", `#${channel} ${d.user}: ${d.message}  ` +
-      `(enviado ${fmtTime(d.timestamp)} | recebido ${fmtTime(received)})`);
+      `(enviado ${fmtTime(d.timestamp)} | recebido ${fmtTime(received)} | relógio ${d.clock})`);
   }
 })();
 
 // REQ com timeout: se não houver resposta, recria o socket e reenvia
 async function request(service, data) {
-  const msg = { service, data: { ...data, timestamp: nowMs() } };
-  const payload = encode(msg);
   for (;;) {
+    const msg = { service, data: { ...data, timestamp: nowMs(), clock: clock.tick() } };
+    const payload = encode(msg);
     const sock = new zmq.Request({ linger: 0, receiveTimeout: TIMEOUT_MS });
     sock.connect(BROKER);
     try {
@@ -46,6 +47,7 @@ async function request(service, data) {
       await sock.send(payload);
       const [raw] = await sock.receive();
       const rep = decode(raw);
+      clock.update(rep.data.clock); // relógio lógico: max(local, recebido)
       log(NAME, "RECEBIDO", rep);
       return rep;
     } catch (err) {
