@@ -1,5 +1,7 @@
 # Sistema de troca de mensagens instantâneas (estilo BBS/IRC)
 
+Integrantes: Fernando de Souza Batista RA: 52.124.010-1; Akira Higa RA: 52.125.017-5
+
 Projeto de Sistemas Distribuídos. Bots (clientes) conversam com servidores usando **ZeroMQ**,
 tudo executado em containers e orquestrado com Docker Compose. Nenhuma interação humana é necessária.
 
