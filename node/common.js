@@ -4,7 +4,7 @@ const { encode, decode } = require("@msgpack/msgpack");
  * Relógio lógico (Lamport, conforme a aula) + relógio físico ajustável.
  * Lógico: tick() antes de cada envio; update(recebido) = max(local, recebido) a cada recebimento.
  * Físico: o relógio do SO não é alterado; mantemos um offset corrigido na sincronização com o
- *         serviço de referência. CLOCK_SKEW_MS simula um relógio com defeito (padrão 0).
+ *         coordenador (Berkeley). CLOCK_SKEW_MS simula um relógio com defeito (padrão 0).
  */
 class Clock {
   constructor() {
@@ -18,6 +18,10 @@ class Clock {
   }
   rawMs() { return Date.now() + this.skewMs; }          // relógio local sem correção
   nowMs() { return this.rawMs() + this.offsetMs; }      // relógio local corrigido
+  adjust(deltaMs) {                                     // usado pelo coordenador ao adotar a média
+    this.offsetMs += deltaMs;
+    return this.offsetMs;
+  }
   sync(refTime, t0, t1) {                               // compensa metade do RTT
     const estimate = refTime + Math.floor((t1 - t0) / 2);
     this.offsetMs = estimate - t1;
