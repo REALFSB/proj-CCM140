@@ -23,44 +23,147 @@ const REF_TIMEOUT_MS = 3000;
 const PEER_TIMEOUT_MS = 2000;
 const STALE_MS = 60000;      // relógio reportado há mais que isso não entra na média de Berkeley
 const TOPIC = "servers";     // tópico Pub/Sub do anúncio do coordenador
+// Replicação (Parte 5). O "$" não é permitido em nomes de canal: nenhum canal colide com este tópico
+// nem recebe este tráfego por casamento de prefixo.
+const REPL_TOPIC = "$replication";
+const ANTI_ENTROPY_S = Number(process.env.ANTI_ENTROPY_S || 10); // intervalo da sincronização periódica
+const GAP_SYNC_S = 3;        // intervalo mínimo entre sincronizações quando há lacunas conhecidas
+const SYNC_LIMIT = 500;      // eventos por resposta de sincronização
+const EVENT_TYPES = ["login", "channel", "message"];
 
 // estado da eleição: S.coordinator é a variável com o nome do coordenador eleito
-const S = { rank: null, coordinator: null, coordinatorRank: null, servers: [] };
+const S = { rank: null, coordinator: null, coordinatorRank: null, servers: [], lastSync: 0, syncIdx: -1 };
+const net = { store: null };
 const reports = new Map(); // só no coordenador: nome -> { time, at } (hora reportada, relógio local bruto)
 let electing = false;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Persistência em JSON Lines: uma linha por evento (login, canal ou mensagem)
+// Ordem total dos eventos em todos os servidores: relógio lógico, depois origem e sequência
+const cmpEvents = (a, b) =>
+  (a.clock - b.clock) || (a.origin < b.origin ? -1 : a.origin > b.origin ? 1 : 0) || (a.seq - b.seq);
+
+/*
+ * Log de eventos replicado, persistido em JSON Lines (uma linha por evento).
+ * Todo evento (login, canal ou mensagem) tem um ID único (origin, seq): `origin` é o servidor que o
+ * criou e `seq` um contador desse servidor. Receber o mesmo evento duas vezes não tem efeito.
+ * `vv` (vetor de versões) guarda, por origem, o maior seq sem lacunas já recebido.
+ */
 class Storage {
-  constructor(file) {
+  constructor(file, name) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    this.channels = [];
-    this.messages = [];
+    this.name = name;
+    this.events = {};          // origem -> { seq: evento }
+    this.vv = {};              // origem -> maior seq contíguo recebido
+    this.maxSeq = {};          // origem -> maior seq recebido (maior que vv => há lacuna)
+    this.channels = new Map(); // nome do canal -> evento de criação (prevalece o menor)
+    this.messages = [];        // eventos de mensagem
+    this.ownSeq = 0;
+    let legacy = 0;
     if (fs.existsSync(file)) {
       for (const line of fs.readFileSync(file, "utf-8").split("\n")) {
-        try {
-          const rec = JSON.parse(line);
-          if (rec.type === "channel" && !this.channels.includes(rec.name)) this.channels.push(rec.name);
-          else if (rec.type === "message") {
-            const { channel, user, message, timestamp, clock } = rec;
-            this.messages.push({ channel, user, message, timestamp, clock });
-          }
-        } catch (_) { /* linha vazia/inválida */ }
+        let rec;
+        try { rec = JSON.parse(line); } catch (_) { continue; }
+        if (rec === null || typeof rec !== "object" || !EVENT_TYPES.includes(rec.type)) continue;
+        if (rec.origin === undefined || rec.seq === undefined) { // registro de uma versão sem replicação
+          legacy += 1;
+          rec = { ...rec, origin: name, seq: legacy };
+        }
+        rec.clock = rec.clock || 0;
+        rec.timestamp = rec.timestamp || 0;
+        this._apply(rec);
       }
     }
     this.fd = fs.openSync(file, "a");
   }
 
-  append(rec) {
-    fs.writeSync(this.fd, JSON.stringify(rec) + "\n");
-    fs.fsyncSync(this.fd);
+  _apply(ev) {
+    const { origin, seq } = ev;
+    const evs = (this.events[origin] = this.events[origin] || {});
+    if (evs[seq]) return false; // duplicado
+    evs[seq] = ev;
+    this.maxSeq[origin] = Math.max(this.maxSeq[origin] || 0, seq);
+    let v = this.vv[origin] || 0;
+    while (evs[v + 1]) v += 1;
+    this.vv[origin] = v;
+    if (origin === this.name) this.ownSeq = Math.max(this.ownSeq, seq);
+    if (ev.type === "channel") {
+      const cur = this.channels.get(ev.name);
+      if (!cur || cmpEvents(ev, cur) < 0) this.channels.set(ev.name, ev); // mesmo nome = mesmo canal; o mais antigo prevalece
+    } else if (ev.type === "message") {
+      this.messages.push(ev);
+    }
+    return true;
   }
 
-  addMessage(msg, originTimestamp) {
-    this.messages.push(msg);
-    this.append({ type: "message", ...msg, origin_timestamp: originTimestamp });
+  // Aplica um evento (próprio ou replicado) e o grava em disco. false se já existia
+  add(ev) {
+    if (!this._apply(ev)) return false;
+    fs.writeSync(this.fd, JSON.stringify(ev) + "\n");
+    fs.fsyncSync(this.fd);
+    return true;
   }
+
+  hasGaps() {
+    return Object.keys(this.maxSeq).some((o) => this.maxSeq[o] > (this.vv[o] || 0));
+  }
+
+  // Eventos que o solicitante (com vetor de versões `vv`) ainda não tem, até `limit`
+  eventsAfter(vv, limit) {
+    const out = [];
+    for (const origin of Object.keys(this.events)) {
+      const known = Number.isInteger(vv[origin]) ? vv[origin] : 0;
+      const evs = this.events[origin];
+      for (const seq of Object.keys(evs).map(Number).filter((q) => q > known).sort((a, b) => a - b)) {
+        if (out.length >= limit) return { events: out, more: true };
+        out.push(evs[seq]);
+      }
+    }
+    return { events: out, more: false };
+  }
+
+  channelNames() {
+    return [...this.channels.values()].sort(cmpEvents).map((e) => e.name);
+  }
+
+  channelMessages(channel, since) {
+    return this.messages
+      .filter((m) => m.channel === channel && (since == null || m.timestamp > since))
+      .sort(cmpEvents)
+      .map((m) => ({ channel: m.channel, user: m.user, message: m.message, timestamp: m.timestamp, clock: m.clock, origin: m.origin }));
+  }
+
+  total() {
+    return Object.values(this.events).reduce((n, evs) => n + Object.keys(evs).length, 0);
+  }
+}
+
+// Valida um evento recebido de outro servidor
+function validEvent(ev) {
+  if (ev === null || typeof ev !== "object") return false;
+  if (typeof ev.origin !== "string" || !["seq", "clock", "timestamp"].every((k) => Number.isInteger(ev[k])) || ev.seq < 1) return false;
+  const str = (...ks) => ks.every((k) => typeof ev[k] === "string");
+  if (ev.type === "login") return str("user");
+  if (ev.type === "channel") return str("name", "user");
+  if (ev.type === "message") return str("channel", "user", "message");
+  return false;
+}
+
+// Para o log: não imprime as listas grandes de eventos das respostas de sincronização
+function compact(msg) {
+  const d = msg && msg.data;
+  if (d && Array.isArray(d.events)) return { ...msg, data: { ...d, events: `<${d.events.length} eventos>` } };
+  return msg;
+}
+
+// Cria um evento próprio, grava em disco e o replica para os outros servidores
+async function emit(store, pub, type, fields) {
+  const ev = { origin: NAME, seq: store.ownSeq + 1, type, clock: clock.tick(), timestamp: nowMs(), ...fields };
+  store.add(ev); // síncrono: ninguém mais pega este seq
+  const payload = { service: "replicate", data: { event: ev, timestamp: nowMs(), clock: clock.tick(), server: NAME } };
+  await pub.send([Buffer.from(REPL_TOPIC), encode(payload)]);
+  log(NAME, "REPLICA->", payload);
+  return ev;
 }
 
 function reply(service, status, description = "", extra = {}) {
@@ -79,7 +182,7 @@ async function handle(req, store, pub) {
     const user = data.user;
     if (typeof user !== "string" || !VALID_NAME.test(user))
       return reply(service, "erro", "nome de usuário inválido (use 1-32 letras, números, _ ou -)");
-    store.append({ type: "login", user, timestamp: data.timestamp, received_at: nowMs() });
+    await emit(store, pub, "login", { user, origin_timestamp: data.timestamp });
     return reply(service, "sucesso", "login realizado");
   }
 
@@ -87,13 +190,12 @@ async function handle(req, store, pub) {
     const name = data.channel;
     if (!validChannel(name)) return reply(service, "erro", "nome de canal inválido (use 1-32 letras, números, _ ou -)");
     if (RESERVED_CHANNELS.has(name)) return reply(service, "erro", "nome de canal reservado");
-    if (store.channels.includes(name)) return reply(service, "erro", "canal já existe");
-    store.channels.push(name);
-    store.append({ type: "channel", name, user: data.user, timestamp: data.timestamp, received_at: nowMs() });
+    if (store.channels.has(name)) return reply(service, "erro", "canal já existe");
+    await emit(store, pub, "channel", { name, user: data.user || "", origin_timestamp: data.timestamp });
     return reply(service, "sucesso", "canal criado");
   }
 
-  if (service === "channels") return reply(service, "sucesso", "", { channels: [...store.channels] });
+  if (service === "channels") return reply(service, "sucesso", "", { channels: store.channelNames() });
 
   if (service === "publish") {
     const { user, channel, message } = data;
@@ -101,10 +203,12 @@ async function handle(req, store, pub) {
     if (!validChannel(channel) || RESERVED_CHANNELS.has(channel)) return reply(service, "erro", "canal inválido");
     if (typeof message !== "string" || !message.trim() || message.length > MAX_MESSAGE_LEN)
       return reply(service, "erro", `mensagem vazia ou maior que ${MAX_MESSAGE_LEN} caracteres`);
-    // tick: a publicação também é um envio
-    const msg = { channel, user, message, timestamp: nowMs(), clock: clock.tick() };
-    store.addMessage(msg, data.timestamp); // grava antes de publicar
-    const payload = { service: "publication", data: { ...msg, server: NAME } };
+    // grava e replica o evento antes de publicar; só o servidor que recebeu o pedido publica no canal
+    const ev = await emit(store, pub, "message", { channel, user, message, origin_timestamp: data.timestamp });
+    const payload = {
+      service: "publication",
+      data: { channel, user, message, timestamp: ev.timestamp, clock: clock.tick(), server: NAME },
+    };
     await pub.send([Buffer.from(channel), encode(payload)]); // tópico = nome do canal
     log(NAME, "PUBLICOU", { topic: channel, ...payload });
     return reply(service, "sucesso", "mensagem publicada");
@@ -114,8 +218,7 @@ async function handle(req, store, pub) {
     const { channel, since } = data;
     if (!validChannel(channel)) return reply(service, "erro", "canal inválido");
     if (since != null && !Number.isInteger(since)) return reply(service, "erro", "'since' deve ser um timestamp inteiro");
-    const messages = store.messages.filter((m) => m.channel === channel && (since == null || m.timestamp > since));
-    return reply(service, "sucesso", "", { channel, messages });
+    return reply(service, "sucesso", "", { channel, messages: store.channelMessages(channel, since) });
   }
 
   return reply(String(service), "erro", "serviço desconhecido");
@@ -175,14 +278,14 @@ async function peerCall(name, service, extra = {}) {
   const sock = new zmq.Request({ linger: 0, receiveTimeout: PEER_TIMEOUT_MS });
   sock.connect(PEER_MAP[name] || `tcp://${name}:6000`);
   try {
-    log(NAME, "ENV->SRV", { para: name, ...msg });
+    log(NAME, "ENV->SRV", compact({ para: name, ...msg }));
     const t0 = clock.rawMs();
     await sock.send(encode(msg));
     const [raw] = await sock.receive();
     const t1 = clock.rawMs();
     const rep = decode(raw);
     clock.update(rep.data.clock);
-    log(NAME, "REC<-SRV", { de: name, ...rep });
+    log(NAME, "REC<-SRV", compact({ de: name, ...rep }));
     return { rep, t0, t1 };
   } catch (err) {
     log(NAME, "AVISO", { description: `${name} não respondeu`, erro: err.code || err.message });
@@ -294,6 +397,14 @@ function handlePeer(req, pub) {
     return { rep: reply(service, "sucesso", "", { time: berkeley(data.name, data.time) }) };
   }
 
+  if (service === "sync") {
+    const { vv, limit } = data;
+    if (vv === null || typeof vv !== "object" || Array.isArray(vv) || !Number.isInteger(limit) || limit < 1)
+      return { rep: reply(service, "erro", "requisição inválida") };
+    const { events, more } = net.store.eventsAfter(vv, Math.min(limit, 1000));
+    return { rep: reply(service, "sucesso", "", { events, more }) };
+  }
+
   return { rep: reply(String(service), "erro", "serviço desconhecido") };
 }
 
@@ -302,12 +413,12 @@ async function peerLoop(peer, pub) {
     let rep, after = null;
     try {
       const req = decode(raw);
-      log(NAME, "REQ<-SRV", req);
+      log(NAME, "REQ<-SRV", compact(req));
       ({ rep, after } = handlePeer(req, pub));
     } catch (err) {
       rep = reply("desconhecido", "erro", `falha ao processar: ${err.message}`);
     }
-    log(NAME, "REP->SRV", rep);
+    log(NAME, "REP->SRV", compact(rep));
     await peer.send(encode(rep));
     if (after) after().catch((e) => log(NAME, "AVISO", { description: `falha na eleição: ${e.message}` }));
   }
@@ -326,15 +437,69 @@ function onAnnouncement(raw, pub) {
   }
 }
 
+// ---------- replicação ----------
+function onReplication(raw) {
+  const msg = decode(raw);
+  const d = msg.data;
+  clock.update(d.clock);
+  if (d.server === NAME) return; // eco do próprio evento
+  if (!validEvent(d.event)) { log(NAME, "AVISO", { description: "evento replicado inválido", evento: d.event }); return; }
+  const novo = net.store.add(d.event);
+  log(NAME, "REPLICA<-", { ...msg, novo });
+}
+
+// Anti-entropia: pede a `name` os eventos que este servidor ainda não tem (envia seu vetor de versões)
+async function syncWith(name) {
+  let totalNew = 0;
+  for (;;) {
+    const res = await peerCall(name, "sync", { vv: { ...net.store.vv }, limit: SYNC_LIMIT });
+    if (!res || res.rep.data.status !== "sucesso") break;
+    const data = res.rep.data;
+    let added = 0;
+    for (const ev of data.events || []) if (validEvent(ev) && net.store.add(ev)) added += 1;
+    totalNew += added;
+    if (!data.more || added === 0) break; // sem progresso: evita repetir a mesma página
+  }
+  if (totalNew) log(NAME, "SYNC", `${totalNew} eventos novos recebidos de ${name} (total local: ${net.store.total()})`);
+  return totalNew;
+}
+
+async function syncAll() {
+  for (const x of await referenceServers()) if (x.name !== NAME) await syncWith(x.name);
+}
+
+// Sincronização periódica com um servidor (ou com todos, se houver lacunas), mesmo sem tráfego
+let syncing = false;
+async function maybeAntiEntropy() {
+  if (syncing) return;
+  const gaps = net.store.hasGaps();
+  if (Date.now() - S.lastSync < (gaps ? GAP_SYNC_S : ANTI_ENTROPY_S) * 1000) return;
+  S.lastSync = Date.now();
+  const peers = S.servers.filter((x) => x.name !== NAME).map((x) => x.name);
+  if (!peers.length) return;
+  syncing = true;
+  try {
+    let targets = peers;
+    if (!gaps) { S.syncIdx = (S.syncIdx + 1) % peers.length; targets = [peers[S.syncIdx]]; }
+    for (const t of targets) await syncWith(t);
+  } finally {
+    syncing = false;
+  }
+}
+
 async function subLoop(sub, pub) {
   for await (const [topic, raw] of sub) {
-    if (topic.toString() !== TOPIC) continue; // o filtro do SUB é por prefixo: exige o tópico exato
-    try { onAnnouncement(raw, pub); } catch (err) { log(NAME, "AVISO", { description: `anúncio inválido: ${err.message}` }); }
+    const t = topic.toString();
+    if (t !== TOPIC && t !== REPL_TOPIC) continue; // o filtro do SUB é por prefixo: exige o tópico exato
+    try {
+      if (t === TOPIC) onAnnouncement(raw, pub); else onReplication(raw);
+    } catch (err) { log(NAME, "AVISO", { description: `mensagem inválida em ${t}: ${err.message}` }); }
   }
 }
 
 async function main() {
-  const store = new Storage(path.join(DATA_DIR, `${NAME}.jsonl`));
+  const store = new Storage(path.join(DATA_DIR, `${NAME}.jsonl`), NAME);
+  net.store = store;
   const pub = new zmq.Publisher();
   pub.connect(PROXY_XSUB);
 
@@ -342,7 +507,8 @@ async function main() {
   log(NAME, "INFO", {
     description: `broker ${BROKER} | proxy ${PROXY_XSUB}/${PROXY_XPUB} | referência ${REFERENCE}`,
     rank: S.rank,
-    canais_carregados: store.channels.length,
+    eventos_carregados: store.total(),
+    canais_carregados: store.channels.size,
     mensagens_carregadas: store.messages.length,
   });
   await heartbeat();
@@ -353,12 +519,17 @@ async function main() {
   const sub = new zmq.Subscriber();
   sub.connect(PROXY_XPUB);
   sub.subscribe(TOPIC);
+  sub.subscribe(REPL_TOPIC);
   peerLoop(peer, pub);
   subLoop(sub, pub);
 
   await sleep(1000); // dá tempo para a assinatura chegar ao proxy
   await elect(pub);  // eleição ao iniciar: o de maior rank vence
-  await syncClock(pub); // primeira sincronização, antes de atender clientes
+  await syncAll();       // replicação: obtém dos outros servidores tudo o que perdeu enquanto esteve fora
+  await syncClock(pub);  // primeira sincronização do relógio, antes de atender clientes
+  S.lastSync = Date.now() - Math.random() * ANTI_ENTROPY_S * 1000; // escalona a anti-entropia entre servidores
+  setInterval(() => maybeAntiEntropy().catch((e) => log(NAME, "AVISO", { description: `falha na sincronização: ${e.message}` })), 1000);
+  log(NAME, "INFO", { description: "pronto para atender clientes", eventos: store.total(), canais: store.channels.size, mensagens: store.messages.length });
 
   const sock = new zmq.Reply();
   sock.connect(BROKER); // só entra no balanceamento depois de registrado e sincronizado

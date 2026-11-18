@@ -3,9 +3,9 @@
 Projeto de Sistemas Distribuídos. Bots (clientes) conversam com servidores usando **ZeroMQ**,
 tudo executado em containers e orquestrado com Docker Compose. Nenhuma interação humana é necessária.
 
-> **Estado atual: Parte 4** — login, canais, publicação/inscrição (Pub/Sub), persistência,
-> histórico, relógio lógico, serviço de referência (rank, lista, heartbeat) e, **nesta parte,
-> eleição de coordenador (Bully) e sincronização do relógio físico pelo algoritmo de Berkeley**.
+> **Versão final (Parte 5)** — login, canais, publicação/inscrição (Pub/Sub), persistência,
+> histórico, relógio lógico, serviço de referência, eleição de coordenador (Bully), sincronização
+> de relógio (Berkeley) e, **nesta parte, replicação: todos os servidores têm todos os dados**.
 
 ## Como executar
 
@@ -29,6 +29,7 @@ PUB/SUB:  servidores (PUB) ──► proxy :5557 (XSUB) ──► :5558 (XPUB) �
 REQ/REP:  servidores (REQ) ──► serviço de referência :5559 (REP)      (os bots não falam com ele)
 REQ/REP:  servidor (REQ) ◄──► outro servidor :6000 (REP)                (relógio e eleição; porta interna)
 PUB/SUB:  coordenador eleito (PUB) ──► proxy ──► todos os servidores (SUB, tópico `servers`)
+PUB/SUB:  cada servidor (PUB) ──► proxy ──► todos os outros servidores (SUB, tópico `$replication`)
 ```
 
 | Serviço | Linguagem | Quantidade |
@@ -56,19 +57,22 @@ requisições/respostas, nem as publicações, nem as mensagens ao serviço de r
 
 **Persistência:** cada servidor grava em seu próprio arquivo `/data/<nome_do_servidor>.jsonl`
 (JSON Lines, um evento por linha, com `fsync`). Cada servidor tem um volume Docker nomeado próprio,
-então os dados sobrevivem à remoção do container e nunca são compartilhados entre servidores.
-Ao iniciar, o servidor relê o arquivo e reconstrói canais e mensagens. O JSON Lines é usado só em
-disco, não na troca de mensagens.
+então os dados sobrevivem à remoção do container, e os arquivos não são compartilhados: cada
+servidor mantém **a sua cópia completa** dos dados, obtida pela replicação (seção própria abaixo).
+Ao iniciar, o servidor relê o arquivo e reconstrói o estado. O JSON Lines é usado só em disco, não
+na troca de mensagens.
+
+Cada linha é um **evento** com ID único (`origin`, `seq`), que é o que a replicação troca:
 
 ```json
-{"type": "login",   "user": "bot_py_1", "timestamp": 1794443197558, "received_at": 1794443197559}
-{"type": "channel", "name": "canal_6644", "user": "bot_py_1", "timestamp": 1794443197561, "received_at": 1794443197562}
-{"type": "message", "channel": "canal_6644", "user": "bot_js_1", "message": "bom dia (#1)", "timestamp": 1794445000554, "clock": 412, "origin_timestamp": 1794445000553}
+{"origin": "server_py_1", "seq": 1, "type": "login",   "clock": 72,  "timestamp": 1794443197558, "user": "bot_py_1", "origin_timestamp": 1794443197557}
+{"origin": "server_js_2", "seq": 3, "type": "channel", "clock": 75,  "timestamp": 1794443197561, "name": "canal_6644", "user": "bot_py_1", "origin_timestamp": 1794443197560}
+{"origin": "server_py_2", "seq": 9, "type": "message", "clock": 412, "timestamp": 1794445000554, "channel": "canal_6644", "user": "bot_js_1", "message": "bom dia (#1)", "origin_timestamp": 1794445000553}
 ```
 
-Em `message`, `timestamp` e `clock` são o instante físico e o contador lógico da publicação pelo
-servidor; `origin_timestamp` é o instante em que o bot enviou a requisição. A mensagem é gravada
-**antes** de ser publicada.
+`origin` é o servidor que atendeu o cliente e criou o evento; `seq` é um contador desse servidor;
+`clock` e `timestamp` são o contador lógico e o instante físico do evento; `origin_timestamp` é o
+instante em que o bot enviou a requisição. O evento é gravado **antes** de ser publicado.
 
 ## Formato das mensagens
 
@@ -89,8 +93,9 @@ servidores, publicações e do serviço de referência) trazem:
 | `history` | `user`, `channel`, `since` (opcional) | acima + `channel`, `messages` |
 
 (além de `timestamp` e `clock`, presentes em todas). `status` é `"sucesso"` ou `"erro"`; em caso de
-erro, `description` explica o motivo. `history` devolve as mensagens do canal que o servidor possui,
-em ordem de publicação; se `since` for informado, só as posteriores a ele.
+erro, `description` explica o motivo. `history` devolve **todas** as mensagens do canal, na mesma ordem
+em qualquer servidor (relógio lógico, depois origem e sequência); se `since` for informado, só as
+posteriores a ele. Cada item tem `channel`, `user`, `message`, `timestamp`, `clock` e `origin`.
 
 ### Publicação (servidor → proxy → bots)
 
@@ -154,6 +159,8 @@ Mensagens (todas com `timestamp` e `clock`):
 | `election` | `REQ` servidor A → servidor B, `REP: OK` | A envia `name` e `rank`; B responde `status: "OK"` e o `coordinator` que conhece |
 | `clock` | `REQ` servidor → coordenador, `REP: hora correta` | pedido com `name` e `time`; resposta com `time` (hora correta) |
 | anúncio | `PUB` no tópico `servers` | `[servers, {coordinator, rank, timestamp, clock}]`: o eleito avisa todos os servidores |
+| `sync` | `REQ` servidor → servidor, `REP: eventos` | pedido com `vv` (vetor de versões) e `limit`; resposta com `events` e `more` (Parte 5) |
+| `replicate` | `PUB` no tópico `$replication` | `[$replication, {event, timestamp, clock, server}]`: propaga um evento novo (Parte 5) |
 
 Funcionamento:
 
@@ -199,6 +206,76 @@ servidores e `BERKELEY` no coordenador). Somando o defeito simulado ao offset de
 resultado deve ser praticamente o mesmo nos quatro (nos testes, diferenças de poucos milissegundos).
 Para desligar a simulação, remova a variável (o padrão é 0).
 
+## Replicação (Parte 5)
+
+**O problema.** O broker distribui as requisições em round-robin, então cada servidor só tinha as
+mensagens, os canais e os logins que ele mesmo atendeu: se um servidor caísse, parte do histórico se
+perdia, e `history` e `channels` devolviam resultados parciais. O requisito é que **todos os
+servidores tenham todos os dados**.
+
+**Método escolhido:** replicação **ativa, multi-mestre, baseada em log de eventos**, com
+propagação por Pub/Sub e **anti-entropia por vetor de versões** (consistência eventual). A ordem
+dos dados usa o **relógio lógico** da Parte 3.
+
+Por que esse método: o broker não sabe qual servidor atenderá cada requisição, então qualquer
+servidor precisa aceitar escritas. Com isso nenhum servidor é ponto único de falha, nem o
+coordenador. Foi considerada a replicação primário-secundário usando o coordenador eleito, mas ela
+obrigaria toda escrita a passar por ele (mais um salto e escritas paradas durante uma eleição).
+
+**Como foi implementado**
+
+1. **Eventos.** Toda operação que muda o estado (login, criação de canal, mensagem) vira um evento
+   imutável com ID único (`origin`, `seq`) e `clock`. O servidor que atende o cliente cria o evento,
+   grava em disco e o replica.
+2. **Propagação.** O servidor publica o evento no tópico `$replication` (via o proxy, que já existia),
+   e todos os outros o assinam, validam e gravam. Aplicar o mesmo evento duas vezes não tem efeito
+   (a deduplicação é pelo ID), então eventos repetidos e o eco do próprio evento são inofensivos.
+   Só o servidor que **atendeu** o `publish` publica no canal dos bots, para que eles não recebam a
+   mesma mensagem uma vez por servidor. O `$` não é permitido em nomes de canal, então nenhum canal
+   colide com esse tópico ou recebe esse tráfego por casamento de prefixo.
+3. **Anti-entropia.** O Pub/Sub não garante entrega (servidor fora do ar, assinatura que ainda não
+   chegou ao proxy), então a propagação sozinha não basta. Cada servidor mantém um **vetor de
+   versões** `vv` (por origem, o maior `seq` recebido sem lacunas) e usa a mensagem `sync` para pedir
+   a outro servidor os eventos que lhe faltam:
+   - **ao iniciar**, antes de atender clientes, com todos os outros servidores;
+   - **a cada 10 s**, com um servidor por vez (rodízio), mesmo sem tráfego;
+   - **a cada 3 s, com todos**, enquanto houver uma lacuna conhecida (chegou um evento com `seq`
+     maior que o próximo esperado).
+
+   Cada resposta traz até 500 eventos, e o pedido se repete enquanto houver mais e houver progresso.
+4. **Ordem.** Os eventos são ordenados por (`clock`, `origin`, `seq`), uma ordem total igual em todos
+   os servidores. `channels` e `history` devolvem a mesma ordem em qualquer servidor.
+5. **Canais duplicados.** Mesmo nome = mesmo canal. Se dois servidores criarem o mesmo nome ao mesmo
+   tempo, os dois eventos ficam no log e o mais antigo prevalece.
+6. **Servidor que volta.** Ao reiniciar com o disco intacto, ele recupera o que perdeu pelo `sync`.
+   Com o **disco apagado**, recupera tudo, inclusive os próprios eventos, e só depois define o próximo
+   `seq` (maior `seq` próprio já visto + 1), então nunca reutiliza um ID.
+
+**Mudanças em relação ao método original**
+
+- O log de eventos substituiu os registros separados de login, canal e mensagem; o arquivo de cada
+  servidor passou a conter os eventos de **todos** os servidores. Arquivos gravados pelas partes
+  anteriores continuam sendo lidos (cada registro antigo recebe `origin` = o próprio servidor e `seq`
+  pela ordem no arquivo).
+- A propagação via Pub/Sub é complementada pela anti-entropia, por causa da entrega não garantida.
+- Na troca `sync`, o log mostra só a quantidade de eventos (`<N eventos>`) em vez de listá-los.
+- Nos servidores Python, que são de um único thread, uma consulta a outro servidor continua atendendo
+  os pedidos dele enquanto espera a resposta. Sem isso, dois servidores que se consultassem ao mesmo
+  tempo ficariam esperando um ao outro até o timeout.
+
+**Garantias e limites**
+
+- **Consistência eventual:** uma escrita chega aos outros servidores em milissegundos. Nesse
+  intervalo, `channels` e `history` podem diferir entre servidores. Depois de uma falha, a
+  convergência ocorre em até ~10 s (3 s se houver lacuna conhecida).
+- A publicação continua validando só o **formato** do canal, sem exigir que ele exista no servidor
+  que atende: como a replicação é assíncrona, o canal pode ainda não ter chegado a ele.
+- Dois servidores podem responder "sucesso" à criação do mesmo canal ao mesmo tempo; o resultado final
+  tem um único canal.
+- Se um servidor cair entre gravar uma mensagem e publicá-la no canal, os bots inscritos não a
+  recebem, mas ela fica no histórico e é replicada.
+- O log não é compactado e cresce sem limite, o que é aceitável para um protótipo.
+
 ## Tratamento de erros
 
 - **Login:** nome com 1 a 32 caracteres `A-Za-z0-9_-`. Se o servidor responder erro, o bot repete o
@@ -209,7 +286,8 @@ Para desligar a simulação, remova a variável (o padrão é 0).
 - **Publicação:** erro se o usuário ou o canal forem inválidos (incluindo `servers`), ou se a
   mensagem for vazia ou maior que 500 caracteres.
 - **Servidores entre si:** esperam 2 s por outro servidor; sem resposta, ele é tratado como
-  indisponível (disparando a eleição quando é o coordenador).
+  indisponível (disparando a eleição quando é o coordenador). Evento replicado inválido ou
+  malformado é descartado e registrado como `AVISO`.
 - **Sem resposta:** o bot espera 5 s; se não houver resposta, recria o socket e reenvia. Os servidores
   esperam 3 s pelo serviço de referência e, se ele não responder, seguem atendendo clientes e tentam
   de novo no próximo heartbeat.
@@ -225,15 +303,22 @@ Ao conectar, o bot faz login e então:
       entre os que ainda não assina;
    3. escolhe um canal aleatório da lista e envia 10 mensagens aleatórias, com 1 s de intervalo.
 
-O passo 2.2 é repetido a cada rodada porque, sem replicação, a lista de canais pode vir de um
-servidor que ainda não conhece nenhum canal. O filtro do ZeroMQ SUB funciona por prefixo; por isso
+O passo 2.2 é repetido a cada rodada porque, no início, a lista de canais pode vir vazia (os
+primeiros canais ainda estão sendo criados e replicados). O filtro do ZeroMQ SUB funciona por prefixo; por isso
 o bot descarta publicações cujo tópico não seja exatamente um dos canais em que se inscreveu.
 Com `FETCH_HISTORY=1`, o bot pede o `history` do canal ao se inscrever (desligado por padrão).
 
-## Limitações conhecidas (resolvidas na Parte 5)
+## Como verificar a replicação
 
-- Sem replicação, cada servidor conhece apenas os canais criados por ele e só guarda as mensagens
-  que publicou. Como o broker usa round-robin, `channels` e `history` podem devolver resultados
-  parciais ou diferentes conforme o servidor que atende.
-- Pelo mesmo motivo, o servidor **não exige que o canal exista localmente** para publicar: ele
-  valida apenas o formato do nome.
+1. Deixe o sistema rodar por cerca de 1 minuto e compare os arquivos dos servidores:
+   ```bash
+   for s in server_py_1 server_py_2 server_js_1 server_js_2; do
+     echo "$s: $(docker compose exec -T $s sh -c "wc -l < /data/$s.jsonl") eventos"
+   done
+   ```
+   Os quatro números devem ser iguais (ou diferir por poucos eventos, os que estão em trânsito).
+2. Derrube um servidor (`docker compose stop server_py_2`), espere cerca de 30 s e suba de novo
+   (`docker compose start server_py_2`). O log dele mostra `SYNC N eventos novos recebidos de ...`
+   e, depois de alguns segundos, o número de eventos volta a ser igual ao dos outros.
+3. No log, `REPLICA->` mostra um evento enviado e `REPLICA<-` mostra o mesmo evento chegando em
+   outro servidor.
